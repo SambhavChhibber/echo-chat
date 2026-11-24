@@ -1,0 +1,10 @@
+services:
+  api:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      CORS_ORIGINS: http://localhost:5173
+    ports: ["8000:8000"]
+    volumes: ["chatdata:/app/data"]
+volumes:
+  chatdata:

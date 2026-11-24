@@ -1,0 +1,10 @@
+# Pinned on purpose: litellm 1.82.7/1.82.8 and 1.107.0 were compromised on PyPI in 2026.
+# 1.106.2 is the release the maintainers named as the last clean one.
+litellm==1.106.2
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
+pydantic-settings==2.16.3
+aiosqlite==0.22.1
+diskcache==5.6.3
+orjson==3.13.0
+soundfile==0.14.0  # imported by litellm on the cache-hit path
