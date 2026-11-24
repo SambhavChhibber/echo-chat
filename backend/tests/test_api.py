@@ -161,3 +161,16 @@ def test_validation_errors_are_json(client):
     assert send(client, sid, "   ").json()["error"]["code"] == "empty_message"
     assert send(client, sid, "x" * 9000).json()["error"]["code"] == "message_too_long"
     assert client.get("/api/sessions", headers={"X-Client-Id": ""}).status_code == 400
+
+
+def test_failover_when_key_fails_after_stream_opens(client):
+    """A provider error on the first chunk (after the stream opened) must still fail over."""
+    sid = new_session(client)
+    r = send(client, sid, "midstream " + uuid.uuid4().hex, simulate_failures={"mock-primary": "midstream_error"})
+    assert r.status_code == 200, r.text
+    meta = r.json()["message"]["meta"]
+    assert meta["deployment_id"] == "mock-backup"
+    assert [a["outcome"] for a in meta["attempts"]] == ["failed", "served"]
+    assert meta["attempts"][0]["deployment_id"] == "mock-primary"
+    pool = {d["id"]: d for d in client.get("/api/pool").json()["deployments"]}
+    assert pool["mock-primary"]["status"] == "cooldown"

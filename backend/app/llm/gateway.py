@@ -157,7 +157,7 @@ class _GatewayHooks(CustomLogger):
         if trace is not None and dep_id:
             trace.attempts.append(dep_id)
             fault = trace.faults.get(dep_id)
-            if fault and self.gateway.settings.enable_fault_injection:
+            if fault in FAULT_TYPES and self.gateway.settings.enable_fault_injection:
                 # Raised inside LiteLLM's provider path → identical handling to a real error.
                 kwargs["mock_response"] = _build_fault(fault, str(kwargs.get("model")))
                 return kwargs
@@ -312,7 +312,7 @@ class LLMGateway:
 
         Must be consumed inside a single task (the ContextVar trace is task-local).
         """
-        trace = RequestTrace(faults={k: v for k, v in (faults or {}).items() if v in FAULT_TYPES})
+        trace = RequestTrace(faults={k: v for k, v in (faults or {}).items() if v in FAULT_TYPES or v == "midstream_error"})
         token = TRACE.set(trace)
         started = time.perf_counter()
         first_token_at: float | None = None
@@ -333,18 +333,37 @@ class LLMGateway:
             }
             if bypass_cache:
                 kwargs["cache"] = {"no-cache": True}
-            stream = await self.router.acompletion(**kwargs)
-            async for chunk in stream:
-                if getattr(chunk, "usage", None):
-                    usage = chunk.usage
-                if getattr(chunk, "model", None):
-                    model_reported = chunk.model
-                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
-                    text = chunk.choices[0].delta.content
-                    if first_token_at is None:
-                        first_token_at = time.perf_counter()
-                    parts.append(text)
-                    yield "delta", text
+            # LiteLLM's router fails over when a key errors *before* streaming starts. Providers can
+            # also fail just after the stream opens (e.g. Gemini 5xx on the first chunk); in that case
+            # we bench the key ourselves and ask the router again, until a key answers or all failed.
+            for round_no in range(len(self.pool)):
+                try:
+                    stream = await self.router.acompletion(**kwargs)
+                    async for chunk in stream:
+                        if round_no == 0 and not parts and trace.faults.get(self._last_attempt(trace) or "") == "midstream_error":
+                            raise litellm.InternalServerError(
+                                message="Simulated: 500 error after the stream opened", llm_provider="simulated", model="x"
+                            )
+                        if getattr(chunk, "usage", None):
+                            usage = chunk.usage
+                        if getattr(chunk, "model", None):
+                            model_reported = chunk.model
+                        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                            text = chunk.choices[0].delta.content
+                            if first_token_at is None:
+                                first_token_at = time.perf_counter()
+                            parts.append(text)
+                            yield "delta", text
+                    break
+                except Exception as exc:
+                    failed_id = self._last_attempt(trace)
+                    if parts or failed_id is None or round_no == len(self.pool) - 1:
+                        raise
+                    trace.failures.setdefault(failed_id, classify_error(exc))
+                    self._bench(failed_id, exc)
+                    if not await self._has_healthy_untried(trace):
+                        raise
+                    usage, model_reported = None, None
             await asyncio.sleep(0)  # let LiteLLM's failure callbacks flush into the trace
         except Exception as exc:  # every failure mode ends here, never as an unhandled 500
             await asyncio.sleep(0)
@@ -419,12 +438,12 @@ class LLMGateway:
             dep = self.deployments.get(dep_id)
             label = dep.label if dep else dep_id
             model = dep.model_name if dep else ""
-            if dep_id == served:
+            if dep_id == served and dep_id not in trace.failures:
                 out.append(Attempt(dep_id, label, model, "cache" if cache_hit else "served"))
                 continue
             err = trace.failures.get(dep_id)
             if err is None and dep_id in trace.faults:
-                err = AttemptError(trace.faults[dep_id], None, FAULT_TYPES[trace.faults[dep_id]])
+                err = AttemptError(trace.faults[dep_id], None, FAULT_TYPES.get(trace.faults[dep_id], "Simulated failure"))
             out.append(
                 Attempt(
                     dep_id,
@@ -436,6 +455,34 @@ class LLMGateway:
                 )
             )
         return out
+
+    @staticmethod
+    def _last_attempt(trace: RequestTrace) -> str | None:
+        return trace.attempts[-1] if trace.attempts else None
+
+    def _bench(self, dep_id: str, exc: BaseException) -> None:
+        """Put a key in router cooldown after a failure LiteLLM did not see (mid-stream)."""
+        try:
+            from litellm.router_utils.cooldown_handlers import set_cooldown_deployments
+
+            set_cooldown_deployments(
+                litellm_router_instance=self.router,
+                exception_status=getattr(exc, "status_code", 500) or 500,
+                original_exception=exc,
+                deployment=dep_id,
+                time_to_cooldown=self.settings.cooldown_seconds,
+            )
+        except Exception:  # pragma: no cover - best effort
+            pass
+
+    async def _has_healthy_untried(self, trace: RequestTrace) -> bool:
+        try:
+            rows = await self.router.cooldown_cache.async_get_active_cooldowns(list(self.deployments), None)
+            cooling = {dep_id for dep_id, _ in rows}
+        except Exception:
+            cooling = set()
+        tried = set(trace.attempts)
+        return any(d.id not in cooling and d.id not in tried for d in self.pool)
 
     def _record_failure(self, attempt: Attempt) -> None:
         if attempt.outcome != "failed" or attempt.deployment_id not in self.stats:
